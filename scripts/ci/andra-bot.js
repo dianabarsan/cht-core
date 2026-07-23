@@ -17,7 +17,7 @@ const path = require('path');
 const COMMENT_MARKER = '<!-- andra-bot -->';
 const FAILURE_LABEL = 'Status: Waiting for contributor';
 const SUCCESS_LABEL = 'Ready for review';
-const TRUSTED_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+const TRUSTED_ASSOCIATIONS = []; // ['OWNER', 'MEMBER', 'COLLABORATOR'];
 const MESSAGES_DIR = path.join(__dirname, 'andra-bot-messages');
 const PR_TEMPLATE_PATH = path.join(__dirname, '..', '..', '.github', 'PULL_REQUEST_TEMPLATE.md');
 
