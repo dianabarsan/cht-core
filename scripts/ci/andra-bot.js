@@ -7,7 +7,7 @@
  * - the PR author is assigned to the linked issue
  * and posts a single comment listing anything that needs fixing, replaced whenever its
  * content changes so the author is notified (comment edits are silent). The PR is
- * labelled with FAILURE_LABEL while checks fail and SUCCESS_LABEL once they all pass.
+ * labeled with FAILURE_LABEL while checks fail and SUCCESS_LABEL once they all pass.
  *
  * The message texts live in ./andra-bot-messages/ so they can be edited without touching this script.
  */
@@ -42,48 +42,57 @@ const stripComments = (text) => {
   return text;
 };
 
-const getHeadings = (template) => {
-  const headings = stripComments(template).match(/^# .+$/gm) || [];
-  return headings.map(heading => heading.trim());
+const HEADING_PREFIX = '# ';
+const HEADING_REGEX = new RegExp(`^${HEADING_PREFIX}.+$`, 'gm');
+
+const parseSections = (text) => {
+  text = stripComments(text);
+  const headings = [...text.matchAll(HEADING_REGEX)];
+  return headings.map((match, index) => ({
+    heading: match[0].trim().replace(HEADING_PREFIX, ''),
+    content: normalize(text.slice(match.index + match[0].length, headings[index + 1]?.index)),
+  }));
 };
 
-const getSection = (body, heading) => {
-  const start = body.indexOf(heading);
-  if (start === -1) {
-    return null;
-  }
-  const rest = body.slice(start + heading.length);
-  const nextHeading = rest.search(/^# /m);
-  return nextHeading === -1 ? rest : rest.slice(0, nextHeading);
-};
+const getHeadings = (template) => parseSections(template).map(section => section.heading);
 
-const normalize = (text) => stripComments(text).replace(/\s+/g, ' ').trim();
+const normalize = (text) => text.replace(/\s+/g, ' ').trim();
 
-// A section that is empty in the template (placeholder comments only, like Description)
-// must be filled in by the author; pre-filled sections only need to be present.
-const matchesTemplate = (body, template) => {
-  if (!body) {
+// The body must contain every template heading, in the template's order, each with
+// non-empty content (placeholder comments don't count as content).
+const matchesTemplate = (prBody, template) => {
+  if (!prBody) {
     return false;
   }
-  return getHeadings(template).every(heading => {
-    const section = getSection(body, heading);
-    if (section === null) {
+  const bodySections = parseSections(prBody);
+  const templateSections = parseSections(template);
+
+  let bodySectionIndex = 0;
+  for (const templateSection of templateSections) {
+    const index = bodySections.findIndex(section => section.heading === templateSection.heading);
+    // the section isn't found, is out of template order, or has no content
+    if (index < bodySectionIndex || !bodySections[index].content.length) {
       return false;
     }
-    return normalize(getSection(template, heading)) ? true : normalize(section).length > 0;
-  });
+
+    bodySectionIndex = index + 1;
+  }
+  return true;
 };
 
-const licenseUnchanged = (body, template) => {
-  const licenseHeading = getHeadings(template).find(heading => /license/i.test(heading));
-  if (!licenseHeading || !body) {
+const matchesLicense = (prBody, template) => {
+  const templateLicenseSection = parseSections(template).find(section => /license/i.test(section.heading));
+  if (!templateLicenseSection || !prBody) {
     return true;
   }
-  const section = getSection(body, licenseHeading);
-  if (section === null) {
-    return true; // the missing heading is already reported by the template check
-  }
-  return normalize(section) === normalize(getSection(template, licenseHeading));
+
+  // missing section is already covered by the section check. License is the template's
+  // last section, so in the body it absorbs anything the contributor writes below it
+  // (screenshots, notes) — trailing content is fine as long as the license text itself
+  // is intact, so only the start of the section has to match.
+  const bodyLicenseSections = parseSections(prBody)
+    .filter(section => section.heading === templateLicenseSection.heading);
+  return bodyLicenseSections.every(section => section.content.startsWith(templateLicenseSection.content));
 };
 
 const getLinkedIssues = async (github, context) => {
@@ -94,6 +103,10 @@ const getLinkedIssues = async (github, context) => {
           closingIssuesReferences(first: 20) {
             nodes {
               number
+              repository {
+                nameWithOwner
+                owner { login }
+              }
               assignees(first: 20) {
                 nodes { login }
               }
@@ -107,20 +120,27 @@ const getLinkedIssues = async (github, context) => {
     repo: context.repo.repo,
     number: context.payload.pull_request.number,
   });
-  return result.repository.pullRequest.closingIssuesReferences.nodes;
+  // Issues linked from repositories outside the org don't count as linked.
+  return result.repository.pullRequest.closingIssuesReferences.nodes.filter(
+    issue => issue.repository.owner.login === context.repo.owner
+  );
 };
 
 const getLinkedIssueFailure = (pr, linkedIssues) => {
   if (!linkedIssues.length) {
     return getMessage('missing-linked-issue');
   }
-  const isAssigned = linkedIssues.some(
-    issue => issue.assignees.nodes.some(assignee => assignee.login === pr.user.login)
-  );
+  const isAssigned = linkedIssues
+    .some(issue => issue.assignees.nodes.some(assignee => assignee.login === pr.user.login));
   if (isAssigned) {
     return null;
   }
-  const issueList = linkedIssues.map(issue => `#${issue.number}`).join(', ');
+
+  const issueList = linkedIssues
+    .map(issue => issue.repository.nameWithOwner === pr.base.repo.full_name
+                  ? `#${issue.number}`
+                  : `${issue.repository.nameWithOwner}#${issue.number}`)
+    .join(', ');
   return getMessage('not-assigned', { issueList });
 };
 
@@ -130,10 +150,10 @@ const getFailures = async (github, context) => {
 
   const template = readPrTemplate();
   if (!matchesTemplate(pr.body, template)) {
-    const sections = getHeadings(template).map(heading => `\`${heading.slice(2)}\``).join(', ');
+    const sections = getHeadings(template).join(', ');
     failures.push(getMessage('template-mismatch', { sections }));
   }
-  if (!licenseUnchanged(pr.body, template)) {
+  if (!matchesLicense(pr.body, template)) {
     failures.push(getMessage('license-changed'));
   }
 
@@ -158,34 +178,49 @@ const sameContent = (a, b) => a.replaceAll('\r\n', '\n').trim() === b.replaceAll
 
 // Editing a comment does not notify the PR author, so when the content changes the old
 // comment is deleted and a new one is posted instead. Identical content is left alone.
-const syncComment = async (github, context, existingComment, body) => {
+const syncComment = async (github, context, core, { existingComment, body }) => {
   if (existingComment && sameContent(existingComment.body, body)) {
     return;
   }
-  if (existingComment) {
-    await github.rest.issues.deleteComment({
+  try {
+    if (existingComment) {
+      await github.rest.issues.deleteComment({
+        ...context.repo,
+        comment_id: existingComment.id,
+      });
+    }
+    await github.rest.issues.createComment({
       ...context.repo,
-      comment_id: existingComment.id,
+      issue_number: context.payload.pull_request.number,
+      body,
     });
+  } catch (err) {
+    core.warning(`Could not update the AndraBot comment: ${err.message}`);
   }
-  await github.rest.issues.createComment({
-    ...context.repo,
-    issue_number: context.payload.pull_request.number,
-    body,
-  });
 };
 
-const hasLabel = (pr, name) => pr.labels.some(label => label.name === name);
+// Labels are read from the API rather than the event payload: a re-run (or a run
+// superseded within seconds) replays a stale label snapshot, which would strand one
+// label of the pair on the PR.
+const getCurrentLabels = async (github, context, core) => {
+  try {
+    const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+      ...context.repo,
+      issue_number: context.payload.pull_request.number,
+      per_page: 100,
+    });
+    return new Set(labels.map(label => label.name));
+  } catch (err) {
+    core.warning(`Could not read the PR labels: ${err.message}`);
+    return null;
+  }
+};
 
 const addLabel = async (github, context, core, name) => {
-  const pr = context.payload.pull_request;
-  if (hasLabel(pr, name)) {
-    return;
-  }
   try {
     await github.rest.issues.addLabels({
       ...context.repo,
-      issue_number: pr.number,
+      issue_number: context.payload.pull_request.number,
       labels: [name],
     });
   } catch (err) {
@@ -195,14 +230,10 @@ const addLabel = async (github, context, core, name) => {
 };
 
 const removeLabel = async (github, context, core, name) => {
-  const pr = context.payload.pull_request;
-  if (!hasLabel(pr, name)) {
-    return;
-  }
   try {
     await github.rest.issues.removeLabel({
       ...context.repo,
-      issue_number: pr.number,
+      issue_number: context.payload.pull_request.number,
       name,
     });
   } catch (err) {
@@ -211,8 +242,16 @@ const removeLabel = async (github, context, core, name) => {
 };
 
 const swapLabels = async (github, context, core, { add, remove }) => {
-  await addLabel(github, context, core, add);
-  await removeLabel(github, context, core, remove);
+  const currentLabels = await getCurrentLabels(github, context, core);
+  if (!currentLabels) {
+    return;
+  }
+  if (!currentLabels.has(add)) {
+    await addLabel(github, context, core, add);
+  }
+  if (currentLabels.has(remove)) {
+    await removeLabel(github, context, core, remove);
+  }
 };
 
 const findExistingComment = async (github, context) => {
@@ -221,7 +260,9 @@ const findExistingComment = async (github, context) => {
     issue_number: context.payload.pull_request.number,
     per_page: 100,
   });
-  return comments.find(comment => comment.body?.includes(COMMENT_MARKER));
+  return comments.find(
+    comment => comment.user?.type === 'Bot' && comment.body?.includes(COMMENT_MARKER)
+  );
 };
 
 const runAndraBot = async ({ github, context, core }) => {
@@ -232,20 +273,25 @@ const runAndraBot = async ({ github, context, core }) => {
     return;
   }
 
+  if (pr.draft) {
+    core.info(`Skipping AndraBot checks for draft PR #${pr.number}.`);
+    return;
+  }
+
   const failures = await getFailures(github, context);
   const existingComment = await findExistingComment(github, context);
 
   if (!failures.length) {
     if (existingComment) {
       const body = `${COMMENT_MARKER}\n${getMessage('success', { author: pr.user.login })}`;
-      await syncComment(github, context, existingComment, body);
+      await syncComment(github, context, core, { existingComment, body });
     }
     await swapLabels(github, context, core, { add: SUCCESS_LABEL, remove: FAILURE_LABEL });
     core.info('All AndraBot checks passed.');
     return;
   }
 
-  await syncComment(github, context, existingComment, buildCommentBody(pr, failures));
+  await syncComment(github, context, core, { existingComment, body: buildCommentBody(pr, failures) });
   await swapLabels(github, context, core, { add: FAILURE_LABEL, remove: SUCCESS_LABEL });
   core.setFailed(`AndraBot checks failed:\n- ${failures.join('\n- ')}`);
 };
